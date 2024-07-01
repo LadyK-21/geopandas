@@ -77,8 +77,8 @@ crs_mismatch_error = (
 
 class GeoDataFrame(GeoPandasBase, DataFrame):
     """
-    A GeoDataFrame object is a pandas.DataFrame that has a column
-    with geometry. In addition to the standard DataFrame constructor arguments,
+    A GeoDataFrame object is a pandas.DataFrame that has one or more columns
+    containing geometry. In addition to the standard DataFrame constructor arguments,
     GeoDataFrame also accepts the following keyword arguments:
 
     Parameters
@@ -87,9 +87,16 @@ class GeoDataFrame(GeoPandasBase, DataFrame):
         Coordinate Reference System of the geometry objects. Can be anything accepted by
         :meth:`pyproj.CRS.from_user_input() <pyproj.crs.CRS.from_user_input>`,
         such as an authority string (eg "EPSG:4326") or a WKT string.
-    geometry : str or array (optional)
-        If str, column to use as geometry. If array, will be set as 'geometry'
-        column on GeoDataFrame.
+    geometry : str or array-like (optional)
+        Value to use as the active geometry column.
+        If str, treated as column name to use. If array-like, it will be
+        added as new column named 'geometry' on the GeoDataFrame and set as the
+        active geometry column.
+
+        Note that if ``geometry`` is a (Geo)Series with a
+        name, the name will not be used, a column named "geometry" will still be
+        added. To preserve the name, you can use :meth:`~GeoDataFrame.rename_geometry`
+        to update the geometry column name.
 
     Examples
     --------
@@ -193,6 +200,11 @@ class GeoDataFrame(GeoPandasBase, DataFrame):
                 and not geometry.crs == crs
             ):
                 raise ValueError(crs_mismatch_error)
+
+            if hasattr(geometry, "name") and geometry.name not in ("geometry", None):
+                # __init__ always creates geometry col named "geometry"
+                # rename as `set_geometry` respects the given series name
+                geometry = geometry.rename("geometry")
 
             self.set_geometry(geometry, inplace=True, crs=crs)
 
@@ -816,6 +828,42 @@ class GeoDataFrame(GeoPandasBase, DataFrame):
 
         return df
 
+    @classmethod
+    def from_arrow(cls, table, geometry=None):
+        """
+        Construct a GeoDataFrame from a Arrow table object based on GeoArrow
+        extension types.
+
+        See https://geoarrow.org/ for details on the GeoArrow specification.
+
+        This functions accepts any tabular Arrow object implementing
+        the `Arrow PyCapsule Protocol`_ (i.e. having an ``__arrow_c_array__``
+        or ``__arrow_c_stream__`` method).
+
+        .. _Arrow PyCapsule Protocol: https://arrow.apache.org/docs/format/CDataInterface/PyCapsuleInterface.html
+
+        .. versionadded:: 1.0
+
+        Parameters
+        ----------
+        table : pyarrow.Table or Arrow-compatible table
+            Any tabular object implementing the Arrow PyCapsule Protocol
+            (i.e. has an ``__arrow_c_array__`` or ``__arrow_c_stream__``
+            method). This table should have at least one column with a
+            geoarrow geometry type.
+        geometry : str, default None
+            The name of the geometry column to set as the active geometry
+            column. If None, the first geometry column found will be used.
+
+        Returns
+        -------
+        GeoDataFrame
+
+        """
+        from geopandas.io._geoarrow import arrow_to_geopandas
+
+        return arrow_to_geopandas(table, geometry=geometry)
+
     def to_json(
         self, na="null", show_bbox=False, drop_id=False, to_wgs84=False, **kwargs
     ):
@@ -1222,7 +1270,7 @@ properties': {'col1': 'name1'}, 'geometry': {'type': 'Point', 'coordinates': (1.
 
         >>> arrow_table = gdf.to_arrow()
         >>> arrow_table
-        <geopandas.io.geoarrow.ArrowTable object at ...>
+        <geopandas.io._geoarrow.ArrowTable object at ...>
 
         The returned data object needs to be consumed by a library implementing
         the Arrow PyCapsule Protocol. For example, wrapping the data as a
@@ -1240,7 +1288,7 @@ properties': {'col1': 'name1'}, 'geometry': {'type': 'Point', 'coordinates': (1.
 01010000000000000000000040000000000000F03F]]
 
         """
-        from geopandas.io.geoarrow import ArrowTable, geopandas_to_arrow
+        from geopandas.io._geoarrow import ArrowTable, geopandas_to_arrow
 
         table, _ = geopandas_to_arrow(
             self,
@@ -1263,7 +1311,8 @@ properties': {'col1': 'name1'}, 'geometry': {'type': 'Point', 'coordinates': (1.
     ):
         """Write a GeoDataFrame to the Parquet format.
 
-        Any geometry columns present are serialized to WKB format in the file.
+        By default, all geometry columns present are serialized to WKB format
+        in the file.
 
         Requires 'pyarrow'.
 
@@ -1284,14 +1333,21 @@ properties': {'col1': 'name1'}, 'geometry': {'type': 'Point', 'coordinates': (1.
             The encoding to use for the geometry columns. Defaults to "WKB"
             for maximum interoperability. Specify "geoarrow" to use one of the
             native GeoArrow-based single-geometry type encodings.
-        schema_version : {'0.1.0', '0.4.0', '1.0.0', None}
-            GeoParquet specification version; if not provided will default to
-            latest supported version.
+            Note: the "geoarrow" option is part of the newer GeoParquet 1.1
+            specification, should be considered as experimental, and may not
+            be supported by all readers.
         write_covering_bbox : bool, default False
             Writes the bounding box column for each row entry with column
             name 'bbox'. Writing a bbox column can be computationally
             expensive, but allows you to specify a `bbox` in :
             func:`read_parquet` for filtered reading.
+            Note: this bbox column is part of the newer GeoParquet 1.1
+            specification and should be considered as experimental. While
+            writing the column is backwards compatible, using it for filtering
+            may not be supported by all readers.
+        schema_version : {'0.1.0', '0.4.0', '1.0.0', '1.1.0', None}
+            GeoParquet specification version; if not provided, will default to
+            latest supported stable version (1.0.0).
         kwargs
             Additional keyword arguments passed to :func:`pyarrow.parquet.write_table`.
 
@@ -1430,6 +1486,9 @@ properties': {'col1': 'name1'}, 'geometry': {'type': 'Point', 'coordinates': (1.
             The underlying library that is used to write the file. Currently, the
             supported options are "pyogrio" and "fiona". Defaults to "pyogrio" if
             installed, otherwise tries "fiona".
+        metadata : dict[str, str], default None
+            Optional metadata to be stored in the file. Keys and values must be
+            strings. Supported only for "GPKG" driver.
         **kwargs :
             Keyword args to be passed to the engine, and can be used to write
             to multi-layer data, store data within archives (zip files), etc.
@@ -1813,7 +1872,12 @@ properties': {'col1': 'name1'}, 'geometry': {'type': 'Point', 'coordinates': (1.
             return _geodataframe_constructor_with_fallback(
                 pd.DataFrame._from_mgr(mgr, axes)
             )
-        return GeoDataFrame._from_mgr(mgr, axes)
+        gdf = GeoDataFrame._from_mgr(mgr, axes)
+        # _from_mgr doesn't preserve metadata (expect __finalize__ to be called)
+        # still need to mimic __init__ behaviour with geometry=None
+        if (gdf.columns == "geometry").sum() == 1:  # only if "geometry" is single col
+            gdf._geometry_column_name = "geometry"
+        return gdf
 
     @property
     def _constructor_sliced(self):
@@ -2265,6 +2329,16 @@ properties': {'col1': 'name1'}, 'geometry': {'type': 'Point', 'coordinates': (1.
             Suffix to apply to overlapping column names (left GeoDataFrame).
         rsuffix : string, default 'right'
             Suffix to apply to overlapping column names (right GeoDataFrame).
+        distance : number or array_like, optional
+            Distance(s) around each input geometry within which to query the tree
+            for the 'dwithin' predicate. If array_like, must be
+            one-dimesional with length equal to length of left GeoDataFrame.
+            Required if ``predicate='dwithin'``.
+        on_attribute : string, list or tuple
+            Column name(s) to join on as an additional join restriction on top
+            of the spatial predicate. These must be found in both DataFrames.
+            If set, observations are joined only if the predicate applies
+            and values in specified columns match.
 
         Examples
         --------
